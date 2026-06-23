@@ -10,9 +10,12 @@ const fetch   = require('node-fetch');
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
-const MP_TOKEN = process.env.MP_ACCESS_TOKEN;
-const API_KEY  = process.env.API_KEY;
-const MP_BASE  = 'https://api.mercadopago.com';
+const MP_TOKEN     = process.env.MP_ACCESS_TOKEN;
+const API_KEY      = process.env.API_KEY;
+const MP_BASE      = 'https://api.mercadopago.com';
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
+const GIST_ID      = process.env.GIST_ID;
+const GIST_FILE    = 'ticciana-db.json';
 
 app.use(express.json());
 app.use(cors()); // permite llamadas desde tu HTML local
@@ -57,36 +60,76 @@ app.get('/mp/balance', auth, async (req, res) => {
 });
 
 // ── GET /mp/payments — últimos pagos recibidos ───────────────────────────────
-//   ?limit=20  (default 20, max 50)
+//   ?limit=20  (default 20, max 100)
 //   ?dias=30   (últimos N días, default 30)
+//   ?offset=0  (paginación)
 app.get('/mp/payments', auth, async (req, res) => {
   try {
-    const limit = Math.min(parseInt(req.query.limit) || 20, 50);
-    const dias  = parseInt(req.query.dias) || 30;
-    const desde = new Date(Date.now() - dias * 24 * 3600 * 1000).toISOString();
-    const hasta = new Date().toISOString();
+    const limit  = Math.min(parseInt(req.query.limit)  || 20, 100);
+    const dias   = parseInt(req.query.dias)  || 30;
+    const offset = parseInt(req.query.offset) || 0;
+    const desde  = new Date(Date.now() - dias * 24 * 3600 * 1000).toISOString();
+    const hasta  = new Date().toISOString();
 
     const data = await mp(
-      `/v1/payments/search?sort=date_created&criteria=desc&range=date_created&begin_date=${desde}&end_date=${hasta}&limit=${limit}`
+      `/v1/payments/search?sort=date_created&criteria=desc&range=date_created` +
+      `&begin_date=${desde}&end_date=${hasta}&limit=${limit}&offset=${offset}`
     );
 
-    const pagos = (data.results || []).map(p => ({
-      id:          p.id,
-      fecha:       p.date_created,
-      monto:       p.transaction_amount,
-      moneda:      p.currency_id,
-      estado:      p.status,
-      medio:       p.payment_type_id,
-      descripcion: p.description || '',
-      pagador: {
-        nombre: p.payer?.first_name ? `${p.payer.first_name} ${p.payer.last_name || ''}`.trim() : null,
-        email:  p.payer?.email || null,
-        dni:    p.payer?.identification?.number || null
-      },
-      externo_ref: p.external_reference || null
-    }));
+    const pagos = (data.results || []).map(p => {
+      // ── Comisiones y retenciones ──────────────────────────────────────────
+      const fees       = p.fee_details || [];
+      const comisionMP = fees.find(f => f.type === 'mercadopago_fee')?.amount  || 0;
+      const financiacion = fees.find(f => f.type === 'financing_fee')?.amount  || 0;
+      const otrasCom   = fees.filter(f => !['mercadopago_fee','financing_fee'].includes(f.type))
+                              .reduce((s,f) => s + f.amount, 0);
+      const totalCom   = fees.reduce((s,f) => s + f.amount, 0);
 
-    res.json({ total: data.paging?.total || pagos.length, pagos });
+      return {
+        id:              p.id,
+        fecha:           p.date_created,
+        fecha_aprobado:  p.date_approved  || null,
+        monto:           p.transaction_amount,
+        monto_neto:      p.transaction_details?.net_received_amount ?? null,
+        moneda:          p.currency_id,
+        estado:          p.status,
+        medio:           p.payment_type_id,
+        marca:           p.payment_method_id || null,
+        cuotas:          p.installments || 1,
+        descripcion:     p.description || '',
+        pagador: {
+          id:       p.payer?.id   || null,
+          nombre:   p.payer?.first_name
+                      ? `${p.payer.first_name} ${p.payer.last_name || ''}`.trim()
+                      : null,
+          email:    p.payer?.email  || null,
+          dni:      p.payer?.identification?.number || null,
+          tipo_doc: p.payer?.identification?.type   || null,
+          telefono: p.payer?.phone?.number
+                      ? `${p.payer.phone.area_code || ''}${p.payer.phone.number}`
+                      : null,
+        },
+        comisiones: {
+          mp:           comisionMP,
+          financiacion: financiacion,
+          otras:        otrasCom,
+          total:        totalCom,
+          detalle: fees.map(f => ({
+            tipo:    f.type,
+            monto:   f.amount,
+            pagador: f.fee_payer
+          }))
+        },
+        impuestos:   p.taxes_amount  || 0,
+        externo_ref: p.external_reference || null,
+      };
+    });
+
+    res.json({
+      total:  data.paging?.total || pagos.length,
+      offset: data.paging?.offset || 0,
+      pagos
+    });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -121,14 +164,12 @@ app.post('/mp/match', auth, async (req, res) => {
     const dias     = parseInt(req.query.dias) || 30;
     const desde    = new Date(Date.now() - dias * 24 * 3600 * 1000).toISOString();
     const hasta    = new Date().toISOString();
-
-    const data  = await mp(`/v1/payments/search?sort=date_created&criteria=desc&range=date_created&begin_date=${desde}&end_date=${hasta}&limit=50`);
-    const pagos = (data.results || []).filter(p => p.status === 'approved');
+    const data     = await mp(`/v1/payments/search?sort=date_created&criteria=desc&range=date_created&begin_date=${desde}&end_date=${hasta}&limit=50`);
+    const pagos    = (data.results || []).filter(p => p.status === 'approved');
 
     const resultado = pagos.map(p => {
       const emailPagador  = (p.payer?.email || '').toLowerCase();
       const nombrePagador = `${p.payer?.first_name || ''} ${p.payer?.last_name || ''}`.toLowerCase().trim();
-
       let match = clientes.find(c => c.email && c.email.toLowerCase() === emailPagador);
       if (!match && nombrePagador) {
         match = clientes.find(c => {
@@ -138,16 +179,15 @@ app.post('/mp/match', auth, async (req, res) => {
                  nc.includes(nombrePagador.split(' ')[0]);
         });
       }
-
       return {
-        id:             p.id,
-        fecha:          p.date_created,
-        monto:          p.transaction_amount,
-        medio:          p.payment_type_id,
-        pagador_email:  p.payer?.email || null,
-        pagador_nombre: nombrePagador || null,
-        cliente_match:  match ? { id: match.id, name: match.name } : null,
-        confianza:      match ? (emailPagador && emailPagador === (match.email||'').toLowerCase() ? 'alta' : 'media') : null
+        id:              p.id,
+        fecha:           p.date_created,
+        monto:           p.transaction_amount,
+        medio:           p.payment_type_id,
+        pagador_email:   p.payer?.email || null,
+        pagador_nombre:  nombrePagador || null,
+        cliente_match:   match ? { id: match.id, name: match.name } : null,
+        confianza:       match ? (emailPagador && emailPagador === (match.email||'').toLowerCase() ? 'alta' : 'media') : null
       };
     });
 
@@ -157,9 +197,56 @@ app.post('/mp/match', auth, async (req, res) => {
   }
 });
 
+// ── GET /db — trae el JSON persistido (GitHub Gist) ─────────────────────────
+app.get('/db', auth, async (req, res) => {
+  try {
+    if (!GITHUB_TOKEN || !GIST_ID)
+      return res.status(503).json({ error: 'GITHUB_TOKEN o GIST_ID no configurados en Railway' });
+    const r = await fetch(`https://api.github.com/gists/${GIST_ID}`, {
+      headers: {
+        Authorization: `Bearer ${GITHUB_TOKEN}`,
+        Accept: 'application/vnd.github.v3+json',
+        'User-Agent': 'ticciana-server'
+      }
+    });
+    if (!r.ok) throw new Error(`GitHub ${r.status}: ${await r.text()}`);
+    const gist = await r.json();
+    const content = gist.files[GIST_FILE]?.content || '{}';
+    res.json(JSON.parse(content));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── PUT /db — guarda el JSON (GitHub Gist) ───────────────────────────────────
+app.put('/db', auth, async (req, res) => {
+  try {
+    if (!GITHUB_TOKEN || !GIST_ID)
+      return res.status(503).json({ error: 'GITHUB_TOKEN o GIST_ID no configurados en Railway' });
+    const r = await fetch(`https://api.github.com/gists/${GIST_ID}`, {
+      method: 'PATCH',
+      headers: {
+        Authorization: `Bearer ${GITHUB_TOKEN}`,
+        Accept: 'application/vnd.github.v3+json',
+        'Content-Type': 'application/json',
+        'User-Agent': 'ticciana-server'
+      },
+      body: JSON.stringify({
+        files: { [GIST_FILE]: { content: JSON.stringify(req.body) } }
+      })
+    });
+    if (!r.ok) throw new Error(`GitHub ${r.status}: ${await r.text()}`);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── Inicio ───────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`✅ Ticciana MP Server corriendo en puerto ${PORT}`);
-  if (!MP_TOKEN) console.warn('⚠️  MP_ACCESS_TOKEN no configurado — las rutas /mp/* van a fallar');
-  if (!API_KEY)  console.warn('⚠️  API_KEY no configurada — el servidor está abierto sin autenticación');
+  if (!MP_TOKEN)     console.warn('⚠️  MP_ACCESS_TOKEN no configurado — las rutas /mp/* van a fallar');
+  if (!API_KEY)      console.warn('⚠️  API_KEY no configurada — el servidor está abierto sin autenticación');
+  if (!GITHUB_TOKEN) console.warn('⚠️  GITHUB_TOKEN no configurado — /db va a fallar');
+  if (!GIST_ID)      console.warn('⚠️  GIST_ID no configurado — /db va a fallar');
 });
